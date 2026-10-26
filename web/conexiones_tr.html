@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="./static/TR_symbol.svg">
+<title>Cálculo de conexiones · Técnicas Reunidas</title>
+<!-- Estilos CSS externos -->
+<link rel="stylesheet" href="css/styles.css?v=13">
+<!-- Librería SheetJS para lectura y exportación de Excel/CSV localmente -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+
+<aside>
+  <div class="origin">
+    <p class="eyebrow">Iniciativas de innovación</p>
+    <h2>Machine Learning aplicado a Civil</h2>
+    <p>Herramientas desarrolladas desde el departamento civil para acelerar decisiones de diseño con modelos predictivos.</p>
+    <div class="initiative-line" aria-hidden="true"></div>
+  </div>
+  <div class="brand"><img src="./static/TR_logo.svg" width="120px"><span><p style="text-align: center">Innovación con Machine Learning en Civil</p></span></div>
+  <div class="srv">
+    <label for="model">Modelo</label>
+    <select id="model"></select>
+  </div>
+</aside>
+
+<main>
+  <header class="page-head">
+    <h1 id="title">Diseño predictivo de conexiones a momento atornilladas con chapa frontal</h1>
+    <p class="sub" id="sub">Predicción asistida por Machine Learning para acelerar el pre-diseño y la comprobación de uniones metálicas.</p>
+  </header>
+
+  <section>
+    <h2>Nueva combinación</h2>
+    <div class="grid" id="form"></div>
+    <div class="actions">
+      <button class="btn" id="add">Añadir a la tabla</button>
+      <button class="btn ghost" id="reset">Limpiar campos</button>
+      <button class="btn ghost" id="btnUploadExcel"> Cargar Excel / CSV</button>
+      <input type="file" id="excelFileInput" accept=".xlsx, .xls, .csv" style="display:none">
+    </div>
+  </section>
+
+  <section>
+    <h2>Combinaciones a pre-diseñar (<span id="count">0</span>)</h2>
+    <div class="tablewrap" id="tbl"></div>
+    <div class="actions">
+      <button class="btn" id="send" disabled>Pre-diseñar con IA</button>
+      <button class="btn ghost" id="clear" disabled>Vaciar tabla</button>
+    </div>
+    <div id="status" role="status"></div>
+  </section>
+
+  <!-- PANTALLA PRINCIPAL: RESUMEN DE RESULTADOS Y SELECCIÓN DE VARIANTES -->
+  <section id="resSec" style="display:none">
+    <h2 class="sec-head">
+      <span>Resultados del servidor <small style="font-weight:400;color:var(--tr-muted)">· Selecciona las variantes a conservar</small></span>
+    </h2>
+    <div class="tablewrap" id="res"></div>
+  </section>
+
+  <!-- NUEVA SECCIÓN: TABLA DE CONEXIONES Y VARIANTES ACEPTADAS -->
+  <section id="acceptedSec" style="display:none">
+    <h2 class="sec-head">
+      <span>Variantes Aceptadas (<span id="acceptedCount">0</span>)</span>
+      <button class="hbtn" id="exportAcceptedExcel" title="Descargar variantes aceptadas en Excel">
+        <img src="./static/download.svg" width="16" height="16" alt="Descargar Excel" style="display: block;">
+      </button>
+      <button class="hbtn" id="exportCheckExcel" title="Descargar informe completo de comprobaciones AISC 360">
+        <img src="./static/download.svg" width="16" height="16" alt="Descargar Comprobaciones" style="display: block; filter: hue-rotate(180deg);">
+      </button>
+    </h2>
+    <div class="tablewrap" id="acceptedTbl"></div>
+    <div class="actions">
+      <button class="btn green" id="sendAccepted" disabled>Enviar variantes aceptadas al dataset de reentreno</button>
+    </div>
+  </section>
+</main>
+
+<!-- VENTANA MODAL EN SUPERPOSICIÓN (OVERLAY) SIN TABS EN CABECERA -->
+<div id="viewer" class="viewer" style="display:none">
+  <div class="viewer-head">
+    <button class="btn ghost" id="viewerBack">← Volver</button>
+    <div class="viewer-title" id="viewerTitle">Visualización 2D</div>
+    <div class="viewer-actions">
+      <button class="btn ghost" id="viewerReset">Reset a predicción ajustada</button>
+      <button class="btn ghost" id="viewerRawReset">Reset a predicción sin ajuste</button>
+      <button class="btn green" id="viewerSave" disabled>Guardar</button>
+    </div>
+  </div>
+
+  <div class="viewer-body">
+    <aside class="viewer-panel" id="viewerPanel"></aside>
+    <div class="viewer-views">
+      <div class="view-card">
+        <h3>Vista Frontal (chapa)</h3>
+        <svg id="vFront" width="520" height="620"></svg>
+      </div>
+      <div class="view-card">
+        <h3>Vista Lateral (perfil)</h3>
+        <svg id="vSide" width="580" height="620"></svg>
+      </div>
+      <div class="view-card">
+        <h3>Vista Superior (sección C-C)</h3>
+        <svg id="vTop" width="500" height="380"></svg>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="scripts/main.js?v=13"></script>
+</body>
+</html>

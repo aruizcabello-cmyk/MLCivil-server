@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+*.py[cod]
+.git-onedrive-placeholder/
+.gitignore-onedrive-placeholder/
+.env
+*.log
+.gitignore-onedrive-placeholder
+.python-version
