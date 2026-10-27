@@ -211,19 +211,32 @@ def _hay_sin_cantonera(historial: List[Dict[str, Any]]) -> bool:
     return any(not r["con_cantonera"] for r in historial if r["paso"] >= 1)
 
 
-def _motivo(clave: str, historial: List[Dict[str, Any]]) -> str:
+def _motivo(clave: str, historial: List[Dict[str, Any]]) -> tuple[str, str]:
+    """Devuelve (codigo, mensaje) del motivo por el que un escenario no existe."""
     if clave == "E3" and not _hay_cantonera(historial):
-        return "Ninguna predicción del barrido de cargas genera cantonera: no hay opción de colocar cantonera."
+        return (
+            "E3_SIN_CANTONERA",
+            "Ninguna predicción del barrido de cargas genera cantonera: no hay opción de colocar cantonera.",
+        )
     if clave == "E2" and not _hay_sin_cantonera(historial):
-        return "Todas las predicciones del barrido de cargas llevan cantonera: no hay diseño sin cantonera."
+        return (
+            "E2_SIN_CANTONERA",
+            "Todas las predicciones del barrido de cargas llevan cantonera: no hay diseño sin cantonera.",
+        )
     ok = [r for r in historial if r["cumple"]]
     if not ok:
-        return "Ningún paso cumple la comprobación AISC."
+        return "SIN_PASOS_CUMPLEN", "Ningún paso cumple la comprobación AISC."
     if clave == "E1":
-        return "No se ha procesado el diseño de entrada."
+        return "E1_SIN_DISENO", "No se ha procesado el diseño de entrada."
     if clave == "E2":
-        return "Ningún diseño sin cantonera cumple la comprobación AISC en el barrido de cargas."
-    return "Ningún diseño con cantonera cumple la comprobación AISC en el barrido de cargas."
+        return (
+            "E2_SIN_DISENO",
+            "Ningún diseño sin cantonera cumple la comprobación AISC en el barrido de cargas.",
+        )
+    return (
+        "E3_SIN_DISENO",
+        "Ningún diseño con cantonera cumple la comprobación AISC en el barrido de cargas.",
+    )
 
 
 def generar_escenarios(
@@ -291,28 +304,48 @@ def generar_escenarios(
         parada = "ratio_moment al 100 %" if techo else f"alcanzado max_pasos={max_pasos}"
 
     elegidos = seleccionar(historial)
+    avisos_estructurados: List[Dict[str, str]] = []
+
+    def _aviso(codigo: str, mensaje: str) -> None:
+        avisos.append(mensaje)
+        avisos_estructurados.append({"codigo": codigo, "mensaje": mensaje})
+
     if historial and not historial[0]["cumple"]:
-        avisos.append("El diseño de entrada (paso 0) NO cumple la comprobación AISC.")
+        _aviso(
+            "E1_NO_CUMPLE",
+            "El diseño de entrada (paso 0) NO cumple la comprobación AISC.",
+        )
 
     escenarios, rows, checks, rows_raw = [], [], [], []
     for clave in ("E1", "E2", "E3"):
         r = elegidos[clave]
         if r is None:
             sin_cant = clave == "E3" and not _hay_cantonera(historial)
+            codigo_motivo, motivo = _motivo(clave, historial)
             escenarios.append({"id": clave, "escenario": NOMBRES[clave], "encontrado": False,
                                "sin_opcion_cantonera": sin_cant,
-                               "motivo": _motivo(clave, historial)})
+                               "codigo_motivo": codigo_motivo,
+                               "motivo": motivo})
             if sin_cant:
-                avisos.append("E3: ninguna predicción genera cantonera; no hay opción de colocar cantonera.")
+                _aviso(
+                    "E3_SIN_CANTONERA",
+                    "E3: ninguna predicción genera cantonera; no hay opción de colocar cantonera.",
+                )
             continue
         res = r["_res"]
         etiqueta = f"{clave} - {NOMBRES[clave]}"
         if clave in ("E2", "E3") and not r["cumple"]:
-            avisos.append(f"{clave}: ningún diseño del barrido cumple la comprobación AISC; "
-                          f"se muestra el de mayor carga, que NO cumple.")
+            _aviso(
+                f"{clave}_NO_CUMPLE",
+                f"{clave}: ningún diseño del barrido cumple la comprobación AISC; "
+                f"se muestra el de mayor carga, que NO cumple.",
+            )
         if r["fuera_rango_entrenamiento"]:
-            avisos.append(f"{clave}: cargas fuera del rango de entrenamiento "
-                          f"({', '.join(r['fuera_rango_entrenamiento'])}); el modelo extrapola.")
+            _aviso(
+                "FUERA_RANGO_ENTRENAMIENTO",
+                f"{clave}: cargas fuera del rango de entrenamiento "
+                f"({', '.join(r['fuera_rango_entrenamiento'])}); el modelo extrapola.",
+            )
         escenarios.append({
             "id": clave, "escenario": NOMBRES[clave], "encontrado": True,
             **{x: r[x] for x in ("paso", "factor_carga", "ratio_moment", "ratio_shear", "ratio_axial",
@@ -336,6 +369,7 @@ def generar_escenarios(
         "parada": parada,
         "tiempo_s": round(time.monotonic() - t0, 2),
         "avisos": avisos,
+        "avisos_estructurados": avisos_estructurados,
         "parametros": {"incremento": incremento, "compuesto": compuesto, "max_pasos": max_pasos,
                        "max_fallos_seguidos": max_fallos_seguidos, "carga_max": CARGA_MAX,
                        "timeout_s": timeout_s},

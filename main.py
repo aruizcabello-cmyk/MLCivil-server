@@ -2,7 +2,7 @@
 
 Cada modelo es un paquete autocontenido en `models/<NAME>/` (lo instala el Makefile).
 Se cargan todos los modelos instalados y conviven en memoria; cada peticion se enruta al
-modelo indicado. Los resultados son SIEMPRE las 63 columnas de CODAME (`Tabla_MOMENT_M1`).
+modelo indicado. Los resultados son SIEMPRE las columnas de CODAME (`Tabla_MOMENT_M1`).
 Sobre esa tabla (editada por el revisor) se puede ejecutar la comprobacion AISC 360-10.
 
 Endpoints:
@@ -13,7 +13,9 @@ Endpoints:
   GET  /profiles?names=...      Geometria de secciones (para el visualizador 2D)
   POST /model/activate          Carga/recarga un modelo por nombre
   POST /predict                 {"model": "...", "rows": [...]} -> columnas CODAME + comprobacion ("checks")
-  POST /scenarios               {"row": {...}} -> E1 (entrada), E2/E3 = max. carga que cumple sin/con cantonera
+  POST /scenarios                 {"row": {...}} -> E1 (entrada), E2/E3 = max. carga que cumple sin/con cantonera
+  POST /scenarios/batch/jobs      {"client_id","rows": [...]} -> job asincrono (web)
+  GET  /scenarios/batch/jobs/{id}?since=&limit= -> resultados incrementales del job
   POST /check                   Comprobacion AISC 360-10 sobre filas CODAME
   POST /validate                Guarda filas validadas (sin reentreno)
   GET  /dataset/summary         Resumen del dataset acumulado
@@ -42,6 +44,8 @@ from pydantic import BaseModel, Field
 import pandas as pd
 
 import catalogo
+import checker
+import codame_schema
 import config
 import model_registry
 import escenarios
@@ -53,6 +57,7 @@ import dataset_valid, retrain_manager
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
 
 # Logs: un archivo por sesion (cada arranque del servidor), sin salida por pantalla.
 _LOG_DIR = config.DATA_DIR / "logs"
@@ -222,6 +227,19 @@ _SCENARIO_GATE = _ScenarioGate(
     queue_timeout=config.SCENARIO_QUEUE_TIMEOUT_S,
 )
 
+_SCENARIO_EXEC: Optional[asyncio.Semaphore] = None
+_SCENARIO_EXEC_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _exec_semaphore() -> asyncio.Semaphore:
+    """Semaforo de ejecucion compartido por escenarios (se recrea por event loop)."""
+    global _SCENARIO_EXEC, _SCENARIO_EXEC_LOOP
+    loop = asyncio.get_running_loop()
+    if _SCENARIO_EXEC is None or _SCENARIO_EXEC_LOOP is not loop:
+        _SCENARIO_EXEC = asyncio.Semaphore(config.SCENARIO_WORKERS)
+        _SCENARIO_EXEC_LOOP = loop
+    return _SCENARIO_EXEC
+
 
 async def _run_sync(runner: _Runner, fn, args: tuple, timeout: Optional[float],
                     label: str, kwargs: Optional[Dict[str, Any]] = None):
@@ -241,14 +259,15 @@ async def _run_scenario(name: str, row: Dict[str, Any], label: str, **kwargs) ->
     """Pasa por el control de admision y ejecuta `escenarios.run` dentro del presupuesto."""
     queue_wait = await _SCENARIO_GATE.acquire()
     try:
-        result = await _run_sync(
-            _SCENARIO_RUNNER,
-            escenarios.run,
-            (name, row),
-            config.SCENARIO_TIMEOUT_S,
-            label,
-            {"timeout_s": config.SCENARIO_TIMEOUT_S, **kwargs},
-        )
+        async with _exec_semaphore():
+            result = await _run_sync(
+                _SCENARIO_RUNNER,
+                escenarios.run,
+                (name, row),
+                config.SCENARIO_TIMEOUT_S,
+                label,
+                {"timeout_s": config.SCENARIO_TIMEOUT_S, **kwargs},
+            )
         return result, queue_wait
     finally:
         _SCENARIO_GATE.release()
@@ -292,19 +311,128 @@ def _uid(row: Dict[str, Any]) -> str:
     return str((row or {}).get("UNICODE") or (row or {}).get("Unicode") or "?")
 
 
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+_PERFIL_CAMPOS = ("d_mm", "tw_mm", "tf_mm")
+
+
+def _positivo(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number > 0.0
+
+
+def _perfil_problema(nombre: str) -> Optional[str]:
+    geom = catalogo.get_profile(nombre)
+    if geom is None:
+        return f"perfil '{nombre}' no encontrado en el catalogo Tekla"
+    faltan = [k for k in _PERFIL_CAMPOS if not _positivo(geom.get(k))]
+    if not (_positivo(geom.get("bf_mm")) or _positivo(geom.get("b_mm"))):
+        faltan.append("bf_mm/b_mm")
+    if faltan:
+        return (
+            f"perfil '{nombre}' sin geometria en el catalogo Tekla "
+            f"({', '.join(faltan)} vacio o 0)"
+        )
+    return None
+
+
+def _validar_perfiles(row: Dict[str, Any]) -> Optional[str]:
+    """Valida BEAM/COLUMN antes de predecir. Devuelve el problema o None."""
+    problemas: List[str] = []
+    for col in ("BEAM", "COLUMN"):
+        nombre = str(row.get(col) or "").strip()
+        if not nombre:
+            problemas.append(f"falta {col}")
+            continue
+        problema = _perfil_problema(nombre)
+        if problema:
+            problemas.append(problema)
+    return "; ".join(problemas) if problemas else None
+
+
+def _codame_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Filas CODAME canonicas (columnas CODAME en orden), sin columnas auxiliares."""
+    return codame_schema.fill_missing(row or {})
+
+
 def _compact_result(name: str, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Quita `rows_raw`/`historial` y deja los checks compactos para el tunel MCP."""
-    compact_checks = [
-        {
-            k: c.get(k)
-            for k in ("Unicode", "Escenario", "cumple", "ratio_pesimo", "descripcion_ratio_pesimo")
-            if k in c
+    """Detalle MCP por conexion: columnas CODAME + comprobacion completa por escenario."""
+    rows = {}
+    for row in result.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        clave = str(row.get("Escenario") or "")[:2].upper()
+        if clave in ("E1", "E2", "E3"):
+            rows[clave] = row
+
+    checks = {}
+    for check in result.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        clave = str(check.get("Escenario") or "")[:2].upper()
+        if clave in ("E1", "E2", "E3"):
+            checks[clave] = check
+
+    escenarios: List[Dict[str, Any]] = []
+    for escenario in result.get("escenarios") or []:
+        if not isinstance(escenario, dict):
+            continue
+        clave = str(escenario.get("id") or "").upper()
+        item: Dict[str, Any] = {
+            "escenario_id": clave,
+            "escenario": escenario.get("escenario"),
+            "encontrado": bool(escenario.get("encontrado")),
         }
-        for c in (result.get("checks") or [])
-    ]
-    out = {k: v for k, v in result.items() if k not in ("rows_raw", "historial")}
-    out["checks"] = compact_checks
-    return {"model_name": name, "status": "OK", **out}
+        if not item["encontrado"]:
+            item["motivo"] = {
+                "codigo": escenario.get("codigo_motivo") or "SIN_DISENO",
+                "mensaje": str(escenario.get("motivo") or ""),
+            }
+            escenarios.append(item)
+            continue
+
+        item.update({
+            "paso": escenario.get("paso"),
+            "factor_carga": escenario.get("factor_carga"),
+            "cargas": {
+                "ratio_moment": escenario.get("ratio_moment"),
+                "ratio_shear": escenario.get("ratio_shear"),
+                "ratio_axial": escenario.get("ratio_axial"),
+            },
+            "cumple": escenario.get("cumple"),
+            "Lh": escenario.get("Lh"),
+            "n_cantonera": escenario.get("n_cantonera"),
+            "fuera_rango_entrenamiento": escenario.get("fuera_rango_entrenamiento") or [],
+            "codame": _codame_row(rows.get(clave)),
+        })
+        check = checks.get(clave)
+        item["comprobacion"] = (
+            checker.detalle_comprobacion(check) if check is not None else None
+        )
+        escenarios.append(item)
+
+    avisos = result.get("avisos_estructurados")
+    if not avisos:
+        avisos = [{"codigo": "AVISO", "mensaje": str(texto)}
+                  for texto in (result.get("avisos") or [])]
+
+    return {
+        "parada": result.get("parada"),
+        "tiempo_s": result.get("tiempo_s"),
+        "avisos": avisos,
+        "escenarios": escenarios,
+    }
 
 
 def _run_batch_sync(name: str, rows: List[Dict[str, Any]], options: Dict[str, Any],
@@ -314,6 +442,13 @@ def _run_batch_sync(name: str, rows: List[Dict[str, Any]], options: Dict[str, An
     out: List[Dict[str, Any]] = []
     for row in rows:
         uid = _uid(row)
+        problema_perfil = _validar_perfiles(row)
+        if problema_perfil:
+            out.append({
+                "unicode": uid, "status": "PERFIL_SIN_GEOMETRIA", "http_status": 422,
+                "mensaje": problema_perfil,
+            })
+            continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             out.append({
@@ -346,12 +481,9 @@ def _run_batch_sync(name: str, rows: List[Dict[str, Any]], options: Dict[str, An
                 "unicode": uid, "status": "ERROR_MODELO", "http_status": 404,
                 "mensaje": str(exc),
             })
-        except Exception as exc:  # noqa: BLE001
-            log.exception("[MCP] error generando escenarios (unicode=%s)", uid)
-            out.append({
-                "unicode": uid, "status": "ERROR_SERVIDOR", "http_status": 500,
-                "mensaje": str(exc),
-            })
+        except KeyError as exc:
+            log.exception("KeyError en /scenarios (modelo=%s)", name)
+            raise HTTPException(status_code=404, detail=f"KeyError: {exc}")
     return out
 
 
@@ -359,16 +491,115 @@ async def _run_scenario_batch(name: str, rows: List[Dict[str, Any]], label: str,
                               **kwargs) -> tuple[List[Dict[str, Any]], float]:
     queue_wait = await _SCENARIO_GATE.acquire()
     try:
-        results = await _run_sync(
-            _SCENARIO_RUNNER,
-            _run_batch_sync,
-            (name, rows, kwargs, config.SCENARIO_TIMEOUT_S),
-            config.SCENARIO_TIMEOUT_S + 2.0,
-            label,
-        )
+        async with _exec_semaphore():
+            results = await _run_sync(
+                _SCENARIO_RUNNER,
+                _run_batch_sync,
+                (name, rows, kwargs, config.SCENARIO_TIMEOUT_S),
+                config.SCENARIO_TIMEOUT_S + 2.0,
+                label,
+            )
         return results, queue_wait
     finally:
         _SCENARIO_GATE.release()
+
+
+def _compact_web_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Resultado de /scenarios sin los bloques que la web no usa."""
+    omitidos = {"historial", "tabla", "tabla_markdown", "parametros"}
+    return {
+        clave: valor
+        for clave, valor in result.items()
+        if clave not in omitidos
+    }
+
+
+async def _run_one_scenario(name: str, row: Dict[str, Any],
+                            options: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+    uid = _uid(row)
+    web_id = row.get("__web_id")
+
+    def _error(status: str, http_status: int, mensaje: str) -> Dict[str, Any]:
+        return {"unicode": uid, "web_id": web_id, "status": status,
+                "http_status": http_status, "mensaje": mensaje}
+
+    try:
+        async with _exec_semaphore():
+            result = await _run_sync(
+                _SCENARIO_RUNNER,
+                escenarios.run,
+                (name, row),
+                timeout_s + 2.0,
+                "scenarios_batch",
+                {"timeout_s": timeout_s, **options},
+            )
+        return {
+            "unicode": uid,
+            "web_id": web_id,
+            "status": "OK",
+            "resultado": _compact_web_result(result),
+        }
+    except TimeoutError as exc:
+        return _error("TIMEOUT_SERVIDOR", 504, str(exc))
+    except predictor.InputContractError as exc:
+        return _error("ERROR_ENTRADA", 422, str(exc))
+    except ValueError as exc:
+        return _error("ERROR_ENTRADA", 422, str(exc))
+    except KeyError as exc:
+        return _error("ERROR_MODELO", 404, str(exc))
+    except asyncio.CancelledError:
+        return _error("ERROR_SERVIDOR", 500,
+                      "fila cancelada por un timeout del lote")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("[batch] error generando escenarios (unicode=%s)", uid)
+        return _error("ERROR_SERVIDOR", 500, str(exc))
+
+
+_BATCH_JOBS: Dict[str, Dict[str, Any]] = {}
+_BATCH_JOB_TTL_S = 600
+
+
+def _cleanup_jobs() -> None:
+    ahora = time.time()
+    for job_id, job in list(_BATCH_JOBS.items()):
+        if ahora - job["created"] > _BATCH_JOB_TTL_S:
+            _BATCH_JOBS.pop(job_id, None)
+
+
+def _job_payload(job: Dict[str, Any], since: int, limit: int) -> Dict[str, Any]:
+    resultados = job["resultados"]
+    since = max(0, min(int(since), len(resultados)))
+    limit = max(1, min(int(limit), 10))
+    nuevos = resultados[since:since + limit]
+    return {
+        "job_id": job["id"],
+        "estado": job["estado"],
+        "total": job["total"],
+        "done": len(resultados),
+        "siguiente": since + len(nuevos),
+        "resultados": nuevos,
+        "error": job.get("error"),
+    }
+
+
+async def _run_job(job: Dict[str, Any], name: str, rows: List[Dict[str, Any]],
+                   options: Dict[str, Any]) -> None:
+    try:
+        tareas = [
+            asyncio.create_task(
+                _run_one_scenario(
+                    name, row, options, config.SCENARIO_BATCH_ROW_TIMEOUT_S
+                )
+            )
+            for row in rows
+        ]
+        for futura in asyncio.as_completed(tareas):
+            job["resultados"].append(await futura)
+    except Exception as exc:  # noqa: BLE001
+        job["error"] = str(exc)
+        log.exception("[batch] job %s fallo", job["id"])
+    finally:
+        job["estado"] = "hecho"
 
 
 def _mcp_status(model: str, status: str, http_status: int, message: str,
@@ -397,7 +628,10 @@ mcp = FastMCP(
         f"llamada con varias filas para varias conexiones; no lances una llamada por conexion. "
         f"Como maximo {config.SCENARIO_WORKERS} llamadas en paralelo (mas "
         f"{config.SCENARIO_MAX_QUEUE} en cola). Si recibes SERVIDOR_OCUPADO, reintenta las "
-        f"pendientes en el siguiente turno."
+        f"pendientes en el siguiente turno. La respuesta es compacta: `content` es un resumen "
+        f"corto y `structuredContent` trae por escenario las columnas CODAME y la "
+        f"comprobacion completa (sin tablas ni SVG). Los perfiles sin geometria se rechazan "
+        f"por fila con PERFIL_SIN_GEOMETRIA."
     ),
     stateless_http=True,
     json_response=config.MCP_JSON_RESPONSE,
@@ -408,7 +642,7 @@ mcp = FastMCP(
 
 @mcp.tool()
 async def predecir_conexion(rows: List[Dict[str, Any]], model: str = "") -> Dict[str, Any]:
-    """Pre-diseña conexiones y devuelve las 63 columnas CODAME con sus comprobaciones.
+    """Pre-diseña conexiones y devuelve las columnas CODAME con sus comprobaciones.
 
     Args:
         rows: Lista de diccionarios con las propiedades geométricas y de carga.
@@ -492,59 +726,98 @@ async def listar_modelos() -> Dict[str, Any]:
 # =============================================================================
 # Escenarios de carga (MCP)
 # =============================================================================
-def _batch_summary(results: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Resumen compacto por conexion y lista de errores (para el contexto MCP)."""
-    resumen: List[Dict[str, Any]] = []
+def _batch_counts(results: List[Dict[str, Any]]) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Recuentos del lote por escenario y por estado (conexion y comprobacion)."""
+    por_escenario = {
+        clave: {"encontrado": 0, "cumple": 0, "no_cumple": 0, "no_encontrado": 0}
+        for clave in ("E1", "E2", "E3")
+    }
+    por_estado_conexion: Dict[str, int] = {}
+    por_estado_escenario: Dict[str, int] = {}
     errores: List[Dict[str, Any]] = []
+
     for item in results:
         uid = item.get("unicode", "?")
         status = item.get("status", "ERROR")
+        por_estado_conexion[status] = por_estado_conexion.get(status, 0) + 1
         if status != "OK":
-            err = {
+            errores.append({
                 "unicode": uid, "status": status,
                 "http_status": item.get("http_status"), "mensaje": item.get("mensaje"),
-            }
-            errores.append(err)
-            resumen.append({
-                "unicode": uid, "status": status, "E1": "-", "E2": "-", "E3": "-",
-                "ratio_pesimo": None,
             })
             continue
+
         result = item.get("resultado") or {}
-        escenarios = {e.get("id"): e for e in (result.get("escenarios") or [])}
-        row: Dict[str, Any] = {"unicode": uid, "status": "OK", "parada": result.get("parada")}
-        peor = 0.0
+        escenarios = {
+            str(e.get("escenario_id") or "").upper(): e
+            for e in (result.get("escenarios") or []) if isinstance(e, dict)
+        }
         for clave in ("E1", "E2", "E3"):
-            esc = escenarios.get(clave) or {}
-            if not esc.get("encontrado"):
-                row[clave] = "NO ENCONTRADO"
-            elif esc.get("cumple"):
-                row[clave] = "OK"
+            conteo = por_escenario[clave]
+            escenario = escenarios.get(clave) or {}
+            if not escenario.get("encontrado"):
+                conteo["no_encontrado"] += 1
+                continue
+            conteo["encontrado"] += 1
+            if escenario.get("cumple"):
+                conteo["cumple"] += 1
             else:
-                row[clave] = "NO CUMPLE"
-            try:
-                peor = max(peor, float(esc.get("ratio_pesimo") or 0.0))
-            except (TypeError, ValueError):
-                pass
-        row["ratio_pesimo"] = round(peor, 4) if peor else None
-        resumen.append(row)
-    return resumen, errores
+                conteo["no_cumple"] += 1
+            estado = ((escenario.get("comprobacion") or {}).get("estado")) or "SIN_DATOS"
+            por_estado_escenario[estado] = por_estado_escenario.get(estado, 0) + 1
+
+    return {
+        "por_escenario": por_escenario,
+        "por_estado_conexion": por_estado_conexion,
+        "por_estado_escenario": por_estado_escenario,
+    }, errores
 
 
-def _summary_markdown(resumen: List[Dict[str, Any]]) -> str:
-    lineas = [
-        "| UNICODE | Estado | E1 | E2 | E3 | Ratio pésimo |",
-        "|---|---|---|---|---|---|",
-    ]
-    for r in resumen:
+def _resumen_texto(resumen: Dict[str, Any], conexiones: List[Dict[str, Any]]) -> str:
+    """Markdown corto para el `content` del MCP; el detalle va en structuredContent."""
+    lineas = ["**Resumen del lote**"]
+    estados = ", ".join(f"{k}={v}" for k, v in resumen["por_estado_conexion"].items())
+    if estados:
+        lineas.append(f"- Conexiones: {estados}")
+    for clave in ("E1", "E2", "E3"):
+        c = resumen["por_escenario"][clave]
         lineas.append(
-            "| {u} | {s} | {e1} | {e2} | {e3} | {rp} |".format(
-                u=r.get("unicode", ""), s=r.get("status", ""),
-                e1=r.get("E1", ""), e2=r.get("E2", ""), e3=r.get("E3", ""),
-                rp="" if r.get("ratio_pesimo") is None else r.get("ratio_pesimo"),
+            f"- {clave}: encontrado={c['encontrado']} cumple={c['cumple']} "
+            f"no_cumple={c['no_cumple']} no_encontrado={c['no_encontrado']}"
+        )
+    if resumen["por_estado_escenario"]:
+        estados = ", ".join(f"{k}={v}" for k, v in resumen["por_estado_escenario"].items())
+        lineas.append(f"- Comprobación: {estados}")
+    lineas.append("")
+    lineas.append("| UNICODE | Estado | E1 | E2 | E3 |")
+    lineas.append("|---|---|---|---|---|")
+    for conexion in conexiones:
+        estados_esc: Dict[str, str] = {}
+        for escenario in conexion.get("escenarios") or []:
+            clave = str(escenario.get("escenario_id") or "")
+            if not escenario.get("encontrado"):
+                estados_esc[clave] = "NO"
+            else:
+                estados_esc[clave] = "OK" if escenario.get("cumple") else "NO CUMPLE"
+        lineas.append(
+            "| {u} | {s} | {e1} | {e2} | {e3} |".format(
+                u=conexion.get("unicode", ""), s=conexion.get("status", ""),
+                e1=estados_esc.get("E1", "-"), e2=estados_esc.get("E2", "-"),
+                e3=estados_esc.get("E3", "-"),
             )
         )
     return "\n".join(lineas)
+
+
+def _mcp_result(payload: Dict[str, Any], texto: Optional[str] = None) -> CallToolResult:
+    """Respuesta MCP sin duplicar: texto corto + structuredContent completo."""
+    if texto is None:
+        texto = str(payload.get("mensaje") or payload.get("status") or "OK")
+    return CallToolResult(
+        content=[TextContent(type="text", text=texto)],
+        structuredContent=payload,
+        isError=False,
+    )
 
 
 @mcp.tool()
@@ -553,23 +826,31 @@ async def disenar_escenarios_carga(
     model: str = "",
     incremento: float = 0.05,
     max_pasos: int = 40,
-) -> Dict[str, Any]:
-    """Disena varias conexiones en una sola llamada (maximo configurable, 50 por defecto).
+) -> CallToolResult:
+    """Disena varias conexiones en una sola llamada (maximo configurable, 25 por defecto).
 
     Pasa SIEMPRE una lista en `rows` (no una llamada por conexion). Se procesan como maximo
     `AI_SCENARIO_BATCH_ROWS` conexiones; el resto se descarta y se indica en
-    `n_descartadas`/`descartadas`. No lances una llamada por conexion.
+    `n_descartadas`/`descartadas`.
 
-    Devuelve el detalle en `lote` (una entrada por conexion, con `resultado.rows`,
-    `resultado.checks` compactos, `escenarios` y `tabla_markdown`) y omite `historial`.
-    Tambien incluye `resumen`, `errores`, contadores y una `tabla_markdown` resumen.
+    Respuesta compacta y sin duplicar: `content` lleva un resumen corto y
+    `structuredContent` el detalle. Por conexion devuelve `escenarios`, y cada escenario:
+    `escenario_id` ("E1"/"E2"/"E3"), metadatos, `codame` (las columnas CODAME) y
+    `comprobacion` (todos los ratios y comprobaciones geometricas con valor, limite y
+    estado). No incluye tablas markdown ni SVG.
+
+    Los perfiles sin geometria en el catalogo se rechazan por fila con
+    `PERFIL_SIN_GEOMETRIA` (HTTP 422) antes de llamar al modelo.
+
+    `resumen` trae recuentos por escenario y por estado; `avisos` y `motivo` usan codigos
+    (p. ej. E1_NO_CUMPLE, E3_SIN_CANTONERA).
 
       E1: diseno de entrada (paso 0, sin tocar cargas).
       E2: mayor carga que aguanta SIN cantonera.
       E3: mayor carga que aguanta CON cantonera.
     E2 y E3 priorizan siempre el diseno que cumple la comprobacion AISC 360-10; si ninguno
-    cumple, devuelven el de mayor carga (con aviso). Si no hay ninguna prediccion sin (E2) o con
-    (E3) cantonera, el escenario sale vacio con `encontrado=false` y su motivo.
+    cumple, devuelven el de mayor carga (con aviso). Si no hay opcion sin/con cantonera, el
+    escenario sale `encontrado=false` con su `motivo`.
 
     Args:
         rows: Lista de conexiones (cada una con UNICODE, BEAM, COLUMN, ratio_moment,
@@ -584,7 +865,7 @@ async def disenar_escenarios_carga(
         all_rows = _parse_mcp_rows(rows)
     except ValueError as exc:
         log.warning("[MCP] escenarios entrada invalida: %s", exc)
-        return _mcp_status(name, "ERROR_ENTRADA", 422, str(exc))
+        return _mcp_result(_mcp_status(name, "ERROR_ENTRADA", 422, str(exc)))
 
     max_rows = config.SCENARIO_BATCH_ROWS
     selected = all_rows[:max_rows]
@@ -602,13 +883,13 @@ async def disenar_escenarios_carga(
         )
     except ServerBusyError as exc:
         log.warning("[MCP] escenarios ocupado: %s", exc)
-        return _mcp_status(name, "SERVIDOR_OCUPADO", 503, str(exc), 5)
+        return _mcp_result(_mcp_status(name, "SERVIDOR_OCUPADO", 503, str(exc), 5))
     except TimeoutError as exc:
         log.error("[MCP] escenarios timeout: %s", exc)
-        return _mcp_status(name, "TIMEOUT_SERVIDOR", 504, str(exc), 5)
+        return _mcp_result(_mcp_status(name, "TIMEOUT_SERVIDOR", 504, str(exc), 5))
     except Exception as exc:  # noqa: BLE001
         log.exception("[MCP] error generando escenarios")
-        return _mcp_status(name, "ERROR_SERVIDOR", 500, str(exc))
+        return _mcp_result(_mcp_status(name, "ERROR_SERVIDOR", 500, str(exc)))
 
     has_errors = any(r.get("status") != "OK" for r in results)
     if has_errors:
@@ -618,24 +899,40 @@ async def disenar_escenarios_carga(
     else:
         status = "OK"
 
-    resumen, errores = _batch_summary(results)
-    tabla = _summary_markdown(resumen)
-    log.info(
-        "[MCP] escenarios: %s (procesadas=%d, descartadas=%d, cola=%.1fs)",
-        status, len(selected), len(discarded), queue_wait,
-    )
-    return {
+    resumen, errores = _batch_counts(results)
+    conexiones: List[Dict[str, Any]] = []
+    for item in results:
+        if item.get("status") == "OK":
+            conexiones.append({
+                "unicode": item.get("unicode"),
+                "status": "OK",
+                **(item.get("resultado") or {}),
+            })
+        else:
+            conexiones.append({
+                "unicode": item.get("unicode"),
+                "status": item.get("status"),
+                "http_status": item.get("http_status"),
+                "mensaje": item.get("mensaje"),
+                "escenarios": [],
+            })
+
+    payload = {
         "model_name": name,
         "status": status,
         "n_solicitadas": len(all_rows),
         "n_procesadas": len(selected),
         "n_descartadas": len(discarded),
         "descartadas": discarded_uids,
-        "lote": results,
         "resumen": resumen,
+        "conexiones": conexiones,
         "errores": errores,
-        "tabla_markdown": tabla,
     }
+    log.info(
+        "[MCP] escenarios: %s (procesadas=%d, descartadas=%d, cola=%.1fs)",
+        status, len(selected), len(discarded), queue_wait,
+    )
+    return _mcp_result(payload, _resumen_texto(resumen, conexiones))
 
 
 # =============================================================================
@@ -777,7 +1074,7 @@ def default_model() -> Dict[str, Any]:
     "/schema",
     tags=["modelos"],
     summary="Inputs del modelo y columnas de resultado",
-    response_description="Campos de entrada (tipo/descripcion/opciones) y las 63 columnas CODAME.",
+    response_description="Campos de entrada (tipo/descripcion/opciones) y las columnas CODAME.",
     responses={404: {"description": "El modelo no esta disponible"}},
 )
 def schema(model: str | None = Query(default=None, description="Modelo (por defecto, el configurado)")):
@@ -805,7 +1102,7 @@ def activate_model(payload: ActivateIn):
 @app.post(
     "/predict",
     tags=["inferencia"],
-    summary="Pre-diseña y devuelve las 63 columnas CODAME",
+    summary="Pre-diseña y devuelve las columnas CODAME",
     response_description="Una fila por entrada con las columnas de CODAME.",
     responses={
         422: {"description": "La peticion no cumple el contrato del modelo."},
@@ -925,6 +1222,75 @@ async def scenarios(payload: ScenarioIn):
         result.get("parada"), queue_wait, result.get("tiempo_s", 0.0),
     )
     return {"model_name": name, **result}
+
+
+class ScenarioJobIn(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=120)
+    model: str | None = None
+    rows: List[Dict[str, Any]]
+    incremento: float = Field(default=0.05, gt=0)
+    max_pasos: int = Field(default=40, ge=1, le=200)
+    max_fallos_seguidos: int = Field(default=0, ge=0)
+
+
+@app.post(
+    "/scenarios/batch/jobs",
+    tags=["inferencia"],
+    summary="Crea un lote asincrono y devuelve su id",
+)
+async def create_scenarios_job(payload: ScenarioJobIn):
+    _cleanup_jobs()
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="rows vacio")
+    if len(payload.rows) > config.SCENARIO_BATCH_ROWS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Maximo {config.SCENARIO_BATCH_ROWS} filas por lote",
+        )
+    existing = _BATCH_JOBS.get(payload.client_id)
+    if existing is not None:
+        return _job_payload(existing, 0, 1)
+    name = payload.model or config.MODEL_NAME
+    job = {
+        "id": payload.client_id,
+        "created": time.time(),
+        "estado": "procesando",
+        "total": len(payload.rows),
+        "resultados": [],
+    }
+    _BATCH_JOBS[payload.client_id] = job
+    job["task"] = asyncio.create_task(
+        _run_job(
+            job,
+            name,
+            payload.rows,
+            {
+                "incremento": payload.incremento,
+                "max_pasos": payload.max_pasos,
+                "max_fallos_seguidos": payload.max_fallos_seguidos,
+            },
+        )
+    )
+    log.info(
+        "/scenarios/batch/jobs: job=%s modelo=%s %d filas",
+        payload.client_id, name, len(payload.rows),
+    )
+    return _job_payload(job, 0, 1)
+
+
+@app.get(
+    "/scenarios/batch/jobs/{job_id}",
+    tags=["inferencia"],
+    summary="Consulta un lote asincrono",
+)
+async def get_scenarios_job(job_id: str,
+                            since: int = Query(0, ge=0),
+                            limit: int = Query(2, ge=1, le=10)):
+    _cleanup_jobs()
+    job = _BATCH_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job no encontrado o expirado")
+    return _job_payload(job, since, limit)
 
 
 @app.get("/dataset/summary", tags=["datos"], summary="Resumen del dataset acumulado")

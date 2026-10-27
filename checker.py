@@ -8,7 +8,7 @@ Convierte una fila del esquema CODAME (Tabla_MOMENT_M1, editada por el revisor) 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from modelos import ConexionInput, Perfil
 from calculador import CalculadorAISC36010
@@ -225,6 +225,226 @@ def check_single_row(row: Dict[str, Any]) -> Dict[str, Any]:
     res_dict["ratios"] = resultado["ratios"]
     res_dict["complementarios"] = resultado["complementarios"]
     return res_dict
+
+
+def _ratio_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _ratio_quote(descripcion: Any) -> str:
+    text = str(descripcion or "").strip()
+    return f"«{text}»" if text else "una comprobación sin descripción"
+
+
+def _ratio_list(items: List[Dict[str, Any]], render) -> str:
+    visibles = items[:3]
+    texto = ", ".join(render(item) for item in visibles)
+    if len(items) > len(visibles):
+        texto += f" y {len(items) - len(visibles)} más"
+    return texto
+
+
+def resumen_comprobacion(check: Dict[str, Any]) -> Dict[str, Any]:
+    """Resumen compacto y redactado de una comprobacion AISC para el informe MCP."""
+    ratios: List[Dict[str, Any]] = []
+    for item in check.get("ratios") or []:
+        if not isinstance(item, dict):
+            continue
+        ratio = _ratio_number(item.get("ratio"))
+        if ratio is None:
+            continue
+        ratios.append({
+            "indice": item.get("indice"),
+            "descripcion": str(item.get("descripcion") or "").strip(),
+            "ratio": round(ratio, 4),
+        })
+
+    fallos_geometricos: List[Dict[str, Any]] = []
+    for item in check.get("complementarios") or []:
+        if not isinstance(item, dict):
+            continue
+        resultado = str(item.get("resultado") or "").strip()
+        if resultado.upper().startswith("REVISAR"):
+            fallos_geometricos.append({
+                "indice": item.get("indice"),
+                "descripcion": str(item.get("descripcion") or "").strip(),
+                "resultado": resultado,
+            })
+
+    excedidos = sorted(
+        [item for item in ratios if item["ratio"] > 1.0 + 1e-9],
+        key=lambda item: item["ratio"],
+        reverse=True,
+    )
+
+    if ratios:
+        peor_ratio = max(ratios, key=lambda item: item["ratio"])
+        ratio_max_todos = peor_ratio["ratio"]
+        descripcion_ratio_max_todos = peor_ratio["descripcion"]
+    else:
+        ratio_max_todos = _ratio_number(check.get("ratio_max_todos"))
+        if ratio_max_todos is not None:
+            ratio_max_todos = round(ratio_max_todos, 4)
+        descripcion_ratio_max_todos = str(
+            check.get("descripcion_ratio_max_todos") or ""
+        ).strip()
+
+    ratio_pesimo = _ratio_number(check.get("ratio_pesimo"))
+    if ratio_pesimo is not None:
+        ratio_pesimo = round(ratio_pesimo, 4)
+    descripcion_ratio_pesimo = str(check.get("descripcion_ratio_pesimo") or "").strip()
+    cumple = bool(check.get("cumple"))
+
+    if cumple:
+        estado = "CUMPLE"
+    elif not ratios and not fallos_geometricos:
+        if "cumple" in check and descripcion_ratio_pesimo:
+            estado = "NO_CUMPLE_OTRO"
+        else:
+            estado = "SIN_DATOS"
+    elif excedidos and fallos_geometricos:
+        estado = "NO_CUMPLE_AMBOS"
+    elif excedidos:
+        estado = "NO_CUMPLE_RESISTENCIA"
+    elif fallos_geometricos:
+        estado = "NO_CUMPLE_GEOMETRIA"
+    else:
+        estado = "NO_CUMPLE_OTRO"
+
+    if estado == "SIN_DATOS":
+        detalle = descripcion_ratio_pesimo or "sin datos de comprobación"
+        dictamen = f"Sin datos de comprobación AISC: {detalle}."
+    elif estado == "CUMPLE":
+        partes: List[str] = []
+        if ratio_pesimo is not None:
+            partes.append(
+                f"ratio pésimo {ratio_pesimo:.2f} en "
+                f"{_ratio_quote(descripcion_ratio_pesimo or descripcion_ratio_max_todos)}"
+            )
+        if (
+            ratio_max_todos is not None
+            and ratio_pesimo is not None
+            and abs(ratio_max_todos - ratio_pesimo) > 1e-9
+        ):
+            partes.append(
+                f"máximo global {ratio_max_todos:.2f} en "
+                f"{_ratio_quote(descripcion_ratio_max_todos)}"
+            )
+        dictamen = "Cumple AISC 360-10"
+        if partes:
+            dictamen += ": " + "; ".join(partes)
+        dictamen += "."
+    elif estado == "NO_CUMPLE_OTRO":
+        dictamen = (
+            "No cumple AISC 360-10: "
+            f"{descripcion_ratio_pesimo or 'comprobación no conforme'}."
+        )
+    else:
+        partes = []
+        if excedidos:
+            partes.append(
+                "supera 1.00: "
+                + _ratio_list(
+                    excedidos,
+                    lambda item: f"{_ratio_quote(item['descripcion'])} = {item['ratio']:.2f}",
+                )
+            )
+        if fallos_geometricos:
+            partes.append(
+                "geometría: "
+                + _ratio_list(
+                    fallos_geometricos,
+                    lambda item: f"{item['descripcion']} ({item['resultado']})",
+                )
+            )
+        dictamen = "No cumple AISC 360-10: " + "; ".join(partes) + "."
+        if (
+            ratio_max_todos is not None
+            and ratio_pesimo is not None
+            and abs(ratio_max_todos - ratio_pesimo) > 1e-9
+            and not any(abs(item["ratio"] - ratio_max_todos) < 1e-9 for item in excedidos)
+        ):
+            dictamen += (
+                f" El ratio pésimo clásico es {ratio_pesimo:.2f} en "
+                f"{_ratio_quote(descripcion_ratio_pesimo)}; el máximo global es "
+                f"{ratio_max_todos:.2f} en {_ratio_quote(descripcion_ratio_max_todos)}."
+            )
+
+    return {
+        "cumple": cumple,
+        "estado": estado,
+        "ratio_pesimo": ratio_pesimo,
+        "descripcion_ratio_pesimo": descripcion_ratio_pesimo,
+        "ratio_max_todos": ratio_max_todos,
+        "descripcion_ratio_max_todos": descripcion_ratio_max_todos,
+        "ratios_superan_1": excedidos,
+        "fallos_geometricos": fallos_geometricos,
+        "n_ratios_superan_1": len(excedidos),
+        "n_fallos_geometricos": len(fallos_geometricos),
+        "dictamen": dictamen,
+    }
+
+
+def _estado_complementario(resultado: str) -> str:
+    """Clasifica una comprobacion complementaria: REVISAR, OK o INFO (dato)."""
+    texto = str(resultado or "").strip().upper()
+    if texto.startswith("REVISAR"):
+        return "REVISAR"
+    if texto == "OK" or texto.startswith("OK "):
+        return "OK"
+    return "INFO"
+
+
+def detalle_comprobacion(check: Dict[str, Any]) -> Dict[str, Any]:
+    """Comprobacion completa para la ficha MCP: todos los ratios y complementarios.
+
+    Cada ratio lleva `valor`, `limite` (1.0) y `estado` (OK/EXCEDE/SIN_DATO). Cada
+    comprobacion complementaria lleva `valor`, `limite` (None: el umbral va en el texto)
+    y `estado` (OK/REVISAR/INFO).
+    """
+    detalle = resumen_comprobacion(check)
+
+    ratios: List[Dict[str, Any]] = []
+    for item in check.get("ratios") or []:
+        if not isinstance(item, dict):
+            continue
+        ratio = _ratio_number(item.get("ratio"))
+        if ratio is None:
+            estado = "SIN_DATO"
+            valor = None
+        else:
+            estado = "EXCEDE" if ratio > 1.0 + 1e-9 else "OK"
+            valor = round(ratio, 4)
+        ratios.append({
+            "indice": item.get("indice"),
+            "descripcion": str(item.get("descripcion") or "").strip(),
+            "valor": valor,
+            "limite": 1.0,
+            "estado": estado,
+        })
+
+    complementarios: List[Dict[str, Any]] = []
+    for item in check.get("complementarios") or []:
+        if not isinstance(item, dict):
+            continue
+        resultado = str(item.get("resultado") or "").strip()
+        complementarios.append({
+            "indice": item.get("indice"),
+            "descripcion": str(item.get("descripcion") or "").strip(),
+            "valor": resultado,
+            "limite": None,
+            "estado": _estado_complementario(resultado),
+        })
+
+    detalle["ratios"] = ratios
+    detalle["complementarios"] = complementarios
+    return detalle
 
 
 def check_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

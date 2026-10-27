@@ -95,8 +95,7 @@ y la construcción de objetos Pydantic.
 
 El servidor MCP anuncia su capacidad en `instructions` (máximo de llamadas concurrentes) y
 responde en JSON por defecto (`AI_MCP_JSON_RESPONSE=1`) para evitar los cuelgues de streams
-SSE a través del túnel. `disenar_escenarios_carga` devuelve JSON por lotes con el detalle
-completo en `lote`; se omite `historial` para no engordar innecesariamente la respuesta.
+SSE a través del túnel.
 
 En MCP, los estados ocupado/timeout se devuelven como **resultado estructurado** (no como
 error JSON-RPC) para que Copilot no los convierta en un 504: `status` =
@@ -106,16 +105,62 @@ error JSON-RPC) para que Copilot no los convierta en un 504: `status` =
 ### MCP `disenar_escenarios_carga`: llamadas por lote
 
 El contrato MCP ya no es una conexión por llamada: recibe `rows` (lista, objeto único o
-string JSON) con hasta `AI_SCENARIO_BATCH_ROWS` conexiones (50 por defecto). Las filas del
+string JSON) con hasta `AI_SCENARIO_BATCH_ROWS` conexiones (25 por defecto). Las filas del
 lote se ejecutan **secuencialmente** dentro de una sola plaza del control de admisión.
 Si llegan más de `AI_SCENARIO_BATCH_ROWS`, se procesan las primeras y el resto se descarta;
 la respuesta lo indica en `n_descartadas` y `descartadas`.
 
-La respuesta incluye `lote` con el detalle completo por conexión (`resultado.rows`,
-`resultado.checks` compactos, `escenarios` y `tabla_markdown`), pero **sin `historial`**.
-También incluye `status`, contadores, `resumen` compacto por conexión, `errores` y
-`tabla_markdown` resumen. Una fila con error o timeout no aborta el resto del lote.
-El cliente debe llamar en varios lotes si necesita más conexiones.
+La respuesta es un `CallToolResult` compacto y **sin duplicar**: `content` lleva un resumen
+markdown corto y `structuredContent` el detalle. La estructura es:
+
+```json
+{
+  "model_name": "V12",
+  "status": "OK|CON_ERRORES|CON_DESCARTES",
+  "n_solicitadas": 25, "n_procesadas": 25, "n_descartadas": 0, "descartadas": [],
+  "resumen": {
+    "por_escenario": {"E1": {"encontrado":0,"cumple":0,"no_cumple":0,"no_encontrado":0}, "E2": {}, "E3": {}},
+    "por_estado_conexion": {"OK": 0, "PERFIL_SIN_GEOMETRIA": 0, "ERROR_SERVIDOR": 0},
+    "por_estado_escenario": {"CUMPLE": 0, "NO_CUMPLE_RESISTENCIA": 0, "NO_CUMPLE_GEOMETRIA": 0}
+  },
+  "conexiones": [{
+    "unicode": "MOE6346", "status": "OK", "parada": "...", "tiempo_s": 12.3,
+    "avisos": [{"codigo": "E1_NO_CUMPLE", "mensaje": "..."}],
+    "escenarios": [{
+      "escenario_id": "E1", "escenario": "Diseño de entrada", "encontrado": true,
+      "paso": 0, "factor_carga": 1.0,
+      "cargas": {"ratio_moment": 1.21, "ratio_shear": 0.1, "ratio_axial": 0.0},
+      "cumple": false, "Lh": 0.0, "n_cantonera": 0,
+      "codame": {"...": "columnas CODAME"},
+      "comprobacion": {
+        "estado": "NO_CUMPLE_GEOMETRIA",
+        "ratios": [{"indice": 0, "descripcion": "...", "valor": 0.62, "limite": 1.0, "estado": "OK"}],
+        "complementarios": [{"indice": 6, "descripcion": "...", "valor": "REVISAR: ...", "limite": null, "estado": "REVISAR"}],
+        "ratio_pesimo": 0.87, "ratio_max_todos": 1.12, "dictamen": "..."
+      }
+    }]
+  }],
+  "errores": [{"unicode": "...", "status": "PERFIL_SIN_GEOMETRIA", "http_status": 422, "mensaje": "..."}]
+}
+```
+
+- Cada escenario encontrado incluye **las columnas CODAME** en `codame` y la
+  **comprobación completa** en `comprobacion`: todos los ratios (con `valor`, `limite=1.0` y
+  `estado` `OK`/`EXCEDE`/`SIN_DATO`) y todas las comprobaciones geométricas (con `valor`,
+  `limite=null` y `estado` `OK`/`REVISAR`/`INFO`). No hace falta volver a llamar a
+  `comprobar_aisc`.
+- Los escenarios no encontrados llevan `motivo: {codigo, mensaje}`. Los avisos usan códigos:
+  `E1_NO_CUMPLE`, `E2_NO_CUMPLE`, `E3_NO_CUMPLE`, `E2_SIN_CANTONERA`, `E3_SIN_CANTONERA`,
+  `SIN_PASOS_CUMPLEN`, `E1_SIN_DISENO`, `E2_SIN_DISENO`, `E3_SIN_DISENO`,
+  `FUERA_RANGO_ENTRENAMIENTO`.
+- **Validación previa**: si `BEAM` o `COLUMN` no existen en el catálogo Tekla o no tienen
+  geometría (`d`, `tw`, `tf` o ancho de ala vacíos/0), la fila se rechaza con
+  `PERFIL_SIN_GEOMETRIA` (HTTP 422) **antes de llamar al modelo**. Solo aplica a esta
+  herramienta MCP.
+- El servidor **no devuelve SVG**. Para generar los planos y convertirlos a PDF sin
+  `svglib`/`cairosvg`, ver `doc/visualizacion_svg_desde_predecir_conexion.md`.
+- Una fila con error o timeout no aborta el resto del lote. El cliente debe llamar en varios
+  lotes si necesita más conexiones.
 
 ## Instalar / actualizar un modelo
 
@@ -158,12 +203,19 @@ curl -X POST localhost:8080/model/activate -H "Content-Type: application/json" -
 | GET | `/schema?model=...` | Inputs del modelo (tipo/descripción/opciones) + columnas de resultado |
 | GET | `/` y `/web/...` | Interfaz web (`web/conexiones_tr.html`) |
 | POST | `/model/activate` | `{"name":"V11"}` → carga/recarga un modelo |
-| POST | `/predict` | `{"model":"V11","rows":[...]}` → valida, predice y devuelve las 63 columnas CODAME |
+| POST | `/predict` | `{"model":"V11","rows":[...]}` → valida, predice y devuelve las columnas CODAME |
 | POST | `/scenarios` | `{"row":{...},"incremento":0.05,"max_pasos":40}` → E1/E2/E3; 503 si está ocupado, 504 si agota el tiempo |
 | POST | `/check` | `{"rows":[...]}` (filas CODAME editadas) → comprobación AISC 360-10 |
 | POST | `/dataset/append` | Filas marcadas → traduce a `data_final` y añade al parquet de reentreno (upsert por `Unicode`) |
 | POST | `/validate` | Guarda filas validadas (sin reentreno) |
 | GET | `/dataset/summary` | Resumen del dataset acumulado |
+
+La web usa el flujo asíncrono `/scenarios/batch/jobs`:
+- `POST /scenarios/batch/jobs` con `client_id` y `rows` responde al instante y arranca el
+  cálculo; repetir el POST con el mismo `client_id` devuelve el mismo job (idempotente).
+- `GET /scenarios/batch/jobs/{id}?since=N&limit=1` devuelve los resultados nuevos (incluida
+  la predicción raw `rows_raw`). Si un GET/POST se pierde por el túnel, se reintenta sin
+  perder el trabajo ya calculado.
 
 Sin autenticación (API abierta en la red interna). Documentación interactiva en `/docs`
 (Swagger) y `/redoc`.
@@ -180,7 +232,7 @@ si es categórico) y las **columnas de resultado** (fijas). El input lo define c
            {"key":"Normativas","description":"Normativa aplicable (columna Standards)","type":"categorical","options":["AISC-360-05/10"]},
            {"key":"BEAM","description":"Perfil de la viga","type":"categorical","options":["HEA100","..."]},
            {"key":"ratio_moment","description":"Relacion momento/demanda (0-1)","type":"number"}],
- "result_columns":["Unicode","Standards","...","Estado_IA"]}
+ "result_columns":["Unicode","Normativas","...","Designation"]}
 ```
 
 La web construye el formulario dinámicamente a partir de este esquema.
@@ -197,7 +249,7 @@ omiten; `UNICODE` y los inputs de predicción son obligatorios.
           "grado_acero":"S355JR","clase_tornillo":"10.9"}]}
 ```
 
-Respuesta `200`: por cada fila, **las 63 columnas de CODAME** (`Tabla_MOMENT_M1`),
+Respuesta `200`: por cada fila, **las columnas de CODAME** (`Tabla_MOMENT_M1`),
 idénticas para cualquier modelo. La traducción la hace el **servidor** (`codame.to_codame`,
 usando el catálogo de `server/data`) e **imputa** lo que el modelo no predice (0/vacío/
 constantes).
@@ -226,7 +278,7 @@ vacías, `404` modelo no disponible, `503` sin modelos. **El servidor nunca devu
 por culpa del modelo**: si la traducción a CODAME falla o no cubre alguna columna, esa
 columna vuelve con su valor simbólico por defecto.
 
-## Resultados CODAME (63 columnas)
+## Resultados CODAME
 
 `production/server/codame_schema.py` define `CODAME_COLUMNS` (orden canónico) y
 `CODAME_DEFAULTS` (valores simbólicos de la red de seguridad). El mapeo
@@ -302,7 +354,7 @@ editar una celda marca la fila como `MODIFICADO` y la desmarca. El estado es sol
 3. `POST /model/activate {"name":"V12"}` (o reiniciar).
 
 No hace falta tocar `main.py` ni `predictor.py`: el servidor sólo conoce la interfaz del
-`adapter.py`. La traducción a las 63 columnas CODAME (y la comprobación) las hace el
+`adapter.py`. La traducción a las columnas CODAME (y la comprobación) las hace el
 servidor con su catálogo (`production/server/data`), así el resultado es idéntico entre
 modelos.
 

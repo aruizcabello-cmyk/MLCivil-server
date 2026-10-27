@@ -352,7 +352,8 @@ def _actualizar_lp(work: Dict[str, Any], calc) -> None:
         return
     dev = _n(work.get("dev"))
     c = codame._redond5(_n(work.get("pfo")) + _n(work.get("pfi")) + calc.viga.tf)
-    work["Lp"] = dev + c + sum(_n(work.get(k)) for k in SEP_KEYS) + dev
+    db = codame.diametro_tornillo(work.get("BoltName_ep"))
+    work["Lp"] = dev + c + sum(_n(work.get(k)) for k in SEP_KEYS) + db + dev
 
 
 def _ajustar_geometria(work: Dict[str, Any], max_iter: int = 40) -> List[str]:

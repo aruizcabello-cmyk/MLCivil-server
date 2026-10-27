@@ -215,6 +215,12 @@ def _limites_fisicos(bolt_name, tp_text) -> dict:
     return out
 
 
+def diametro_tornillo(bolt_name) -> float:
+    """'M24' -> 24.0 (0.0 si no hay digitos)."""
+    digitos = "".join(ch for ch in str(bolt_name) if ch.isdigit())
+    return float(digitos) if digitos else 0.0
+
+
 def ajustar_cantonera_y_chapa(row: dict, limites: dict = None) -> bool:
     """Aplica sobre una fila CODAME (la modifica) las reglas de cantonera y largo de chapa:
 
@@ -222,7 +228,9 @@ def ajustar_cantonera_y_chapa(row: dict, limites: dict = None) -> bool:
          las intermedias suben hasta quedar sobre el ala y la ultima queda bajo ella.
          Si no hay hueco, anade filas por debajo.
       2. El ultimo tornillo queda siempre por debajo de la viga/cantonera (+ holgura).
-      3. Lp = ultima fila + e (la chapa acaba `e` mm por debajo del ultimo tornillo).
+      3. Lp = ultima fila + diametro del tornillo + e.
+    La ultima fila queda en e + pfo + d_viga + Lh + holgura (clearance): se SUBE si queda corta
+    y se ACERCA si el modelo la dejo mas abajo (antes solo se subia, y quedaba lejisimos).
 
     `limites` (opcional): {'clearance', 'minsp', 'maxsp', 'c'}; si falta se obtiene de las tablas.
     No toca dev, pfo ni pfi. Devuelve True si cambio la geometria (separaciones o cantonera).
@@ -302,6 +310,20 @@ def ajustar_cantonera_y_chapa(row: dict, limites: dict = None) -> bool:
                 return False
         return False
 
+    def acercar_ultima(objetivo) -> None:
+        """Si la ultima fila queda MAS ABAJO de `objetivo` (el modelo la dejo lejos, o una
+        correccion de separacion maxima la dejo clavada en el tope), reduce su separacion
+        hasta `objetivo`, sin bajar del minimo entre tornillos."""
+        i = ultima()
+        if i < 0:                                      # solo filas 0 y 1 (dev y pfi): no se toca
+            return
+        ys = filas()
+        if ys[-1] <= objetivo:
+            return
+        delta = max(_ceil5(objetivo - ys[-2]), _ceil5(minsp), 5.0)
+        if delta < seps[_SEP_KEYS[i]] and delta <= maxsp:
+            seps[_SEP_KEYS[i]] = delta
+
     if tiene:
         ye = yb + fac * h / sin_a                      # cara inferior del ala de la cantonera (Lh fijo)
 
@@ -333,9 +355,14 @@ def ajustar_cantonera_y_chapa(row: dict, limites: dict = None) -> bool:
             if not claro():
                 log.warning("cantonera: no se pudo despejar el ala de los tornillos con Lh fijo "
                             "(UNICODE=%s)", row.get("Unicode"))
+        if claro():                                    # ultima fila = ye + holgura, ni mas abajo
+            acercar_ultima(ye + m)
     else:
+        objetivo = _ceil5(yb + max(pfo, m + 0.5))
         if filas()[-1] < yb + m:
-            llevar_ultima(_ceil5(yb + max(pfo, m + 0.5)))
+            llevar_ultima(objetivo)
+        else:
+            acercar_ultima(objetivo)
 
     cambio = any(abs(seps[k] - seps0[k]) > 1e-9 for k in _SEP_KEYS) or abs(fac - fac0) > 1e-9
     for k in _SEP_KEYS:
@@ -346,7 +373,8 @@ def ajustar_cantonera_y_chapa(row: dict, limites: dict = None) -> bool:
         row["Lh"] = fac * h / sin_a
         log.info("cantonera creada: Factor %.3f, Lh = %.1f (UNICODE=%s)",
                  fac, row["Lh"], row.get("Unicode"))
-    row["Lp"] = filas()[-1] + dev
+    db = _num(lim.get("db")) or diametro_tornillo(row.get("BoltName_ep"))
+    row["Lp"] = filas()[-1] + db + dev                 # ultima fila + diametro del tornillo + e
     return cambio
 
 

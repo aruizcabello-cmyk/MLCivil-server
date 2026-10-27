@@ -230,3 +230,14 @@ body.modal-open{overflow:hidden}
   .viewer-panel{width:100%;height:auto;max-height:40vh}
   .viewer-views{flex:1;width:100%;overflow:auto}
 }
+
+#viewerDiff{align-self:flex-start;max-width:100%}
+.diff-tbl{font-size:13px;width:auto;min-width:400px}.diff-tbl th,.diff-tbl td{padding:5px 12px}
+/* Comparación de modelos */
+#viewerDiff{overflow-x:auto}
+.diff-cmp th.ga{background:#002B5C}
+.diff-cmp th.gb{background:#7B1FA2}
+.diff-cmp td.sepl,.diff-cmp th.sepl{border-left:2px solid var(--tr-line)}
+.diff-cmp td.na{color:var(--tr-muted);text-align:center}
+.diff-cmp .sum td{font-weight:700;background:#EEF3F9}
+.srv select + label{margin-top:14px}

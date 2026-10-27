@@ -6,7 +6,7 @@
 <link rel="icon" type="image/svg+xml" href="./static/TR_symbol.svg">
 <title>Cálculo de conexiones · Técnicas Reunidas</title>
 <!-- Estilos CSS externos -->
-<link rel="stylesheet" href="css/styles.css?v=13">
+<link rel="stylesheet" href="css/styles.css?v=15">
 <!-- Librería SheetJS para lectura y exportación de Excel/CSV localmente -->
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 </head>
@@ -23,6 +23,8 @@
   <div class="srv">
     <label for="model">Modelo</label>
     <select id="model"></select>
+    <label for="model2" style="margin-top:14px">Comparar con</label>
+    <select id="model2"><option value="">— Sin comparación —</option></select>
   </div>
 </aside>
 
@@ -59,6 +61,7 @@
       <span>Resultados del servidor <small style="font-weight:400;color:var(--tr-muted)">· Selecciona las variantes a conservar</small></span>
     </h2>
     <div class="tablewrap" id="res"></div>
+    <div id="adjStats"></div>
   </section>
 
   <!-- NUEVA SECCIÓN: TABLA DE CONEXIONES Y VARIANTES ACEPTADAS -->
@@ -85,6 +88,7 @@
     <button class="btn ghost" id="viewerBack">← Volver</button>
     <div class="viewer-title" id="viewerTitle">Visualización 2D</div>
     <div class="viewer-actions">
+      <button class="btn ghost" id="viewerGhost">Ocultar predicción del modelo</button>
       <button class="btn ghost" id="viewerReset">Reset a predicción ajustada</button>
       <button class="btn ghost" id="viewerRawReset">Reset a predicción sin ajuste</button>
       <button class="btn green" id="viewerSave" disabled>Guardar</button>
@@ -106,10 +110,11 @@
         <h3>Vista Superior (sección C-C)</h3>
         <svg id="vTop" width="500" height="380"></svg>
       </div>
+      <div class="view-card" id="viewerDiff"></div>
     </div>
   </div>
 </div>
 
-<script src="scripts/main.js?v=13"></script>
+<script src="scripts/main.js?v=17"></script>
 </body>
 </html>

@@ -1,9 +1,9 @@
-"""Esquema canonico de resultados CODAME (`Tabla_MOMENT_M1`, 63 columnas).
+"""Esquema canonico de resultados CODAME (`Tabla_MOMENT_M1`).
 
 Los resultados del servidor son SIEMPRE estas columnas, independientemente del modelo.
-Cada modelo las produce con su `to_codame()`; el servidor solo reordena y, como red de
-seguridad, rellena con `CODAME_DEFAULTS` las que falten (nunca falla por culpa del
-modelo). Referencia: `doc/codame/mapeo_columnas_codame.md`.
+Se omite `Estado_IA` (no se usa en este flujo). Cada modelo las produce con su `to_codame()`;
+el servidor solo reordena y, como red de seguridad, rellena con `CODAME_DEFAULTS` las que
+falten (nunca falla por culpa del modelo). Referencia: `doc/codame/mapeo_columnas_codame.md`.
 """
 
 # Orden de las columnas de Tabla_MOMENT_M1.

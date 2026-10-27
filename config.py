@@ -55,16 +55,19 @@ INFERENCE_TIMEOUT_S = float(
 # Escenarios: N orquestadores + cola acotada. Si se llena la cola o se supera
 # SCENARIO_QUEUE_TIMEOUT_S esperando turno, el servidor responde "ocupado" de inmediato
 # para no agotar el timeout de 100s del cliente MCP.
-SCENARIO_WORKERS = max(1, int(os.environ.get("AI_SCENARIO_WORKERS", "4")))
+SCENARIO_WORKERS = max(1, int(os.environ.get("AI_SCENARIO_WORKERS", "6")))
 SCENARIO_MAX_QUEUE = max(
-    0, int(os.environ.get("AI_SCENARIO_MAX_QUEUE", str(SCENARIO_WORKERS)))
+    0, int(os.environ.get("AI_SCENARIO_MAX_QUEUE", "4"))
 )
-SCENARIO_BATCH_ROWS = max(1, int(os.environ.get("AI_SCENARIO_BATCH_ROWS", "50")))
+SCENARIO_BATCH_ROWS = max(1, int(os.environ.get("AI_SCENARIO_BATCH_ROWS", "25")))
 SCENARIO_QUEUE_TIMEOUT_S = float(
     os.environ.get("AI_SCENARIO_QUEUE_TIMEOUT_S", str(round(CLIENT_TIMEOUT_S * 0.15, 1)))
 )
 SCENARIO_TIMEOUT_S = float(
     os.environ.get("AI_SCENARIO_TIMEOUT_S", str(round(CLIENT_TIMEOUT_S * 0.80, 1)))
+)
+SCENARIO_BATCH_ROW_TIMEOUT_S = float(
+    os.environ.get("AI_SCENARIO_BATCH_ROW_TIMEOUT_S", "30")
 )
 
 # Transporte MCP: JSON suele evitar cuelgues de streams SSE en tuneles. Si tu

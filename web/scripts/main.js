@@ -42,6 +42,7 @@ function evaluateCumple(chk) {
   return ok;
 }
 
+
 /* Helper seguro para obtener variaciones de una conexión */
 function getConnVariations(connIdx) {
   const conn = state.results[connIdx];
@@ -64,6 +65,128 @@ function getConnVariations(connIdx) {
     status: conn.status || (isOk ? "CUMPLE" : "NO CUMPLE"),
     accepted: false
   }];
+}
+
+/* =====================================================================
+   [NUEVO] Diferencias modelo (raw) vs ajustado: tabla, estadística y gráfico
+   ===================================================================== */
+const DIFF_IGNORE = new Set(["unicode","unicode origen","unicode_origen","escenario","raw","adjusted",
+  "check","adjustedcheck","status","accepted","n_cantonera"]);
+const NUMRE = /^-?\d+([.,]\d+)?\s*(mm)?$/i;
+const fmtD = n => typeof n === "number" ? String(Math.round(n * 100) / 100) : String(n);
+
+function diffRows(raw, adj){
+  if (!raw || !adj) return [];
+  const out = [];
+  Object.keys(adj).forEach(k => {
+    if (DIFF_IGNORE.has(k.toLowerCase()) || !(k in raw)) return;
+    const a = raw[k], b = adj[k];
+    if (typeof a === "object" || typeof b === "object") return;
+    if (NUMRE.test(String(a).trim()) && NUMRE.test(String(b).trim())) {
+      const na = vNum(a), nb = vNum(b);
+      if (Math.abs(na - nb) > 1e-9) out.push({ key: k, from: na, to: nb, delta: nb - na });
+    } else if (String(a) !== String(b)) {
+      out.push({ key: k, from: a, to: b, delta: null });
+    }
+  });
+  return out;
+}
+
+function diffSectionHtml(){
+  const v = getConnVariations(VIEW.connIdx)[VIEW.activeVarIndex];
+  if (!v || !v.raw || !Object.keys(v.raw).length) return `<h3>Ajustes sobre la predicción del modelo</h3><div class="empty">Sin predicción del modelo para comparar.</div>`;
+  const dA = diffRows(v.raw, v.adjusted);
+  const c = v.cmp;
+  const hasB = !!(c && c.raw && Object.keys(c.raw).length);
+  const sign = x => x.delta == null ? "" : (x.delta > 0 ? "+" : "") + fmtD(x.delta);
+  const col = x => x.delta > 0 ? "#2E8B57" : "#D52B1E";
+
+  if (!hasB) {
+    const body = dA.length ? dA.map(x => `<tr><td><b>${escHtml(x.key)}</b></td><td>${escHtml(fmtD(x.from))}</td>` +
+        `<td>${escHtml(fmtD(x.to))}</td><td style="color:${col(x)};font-weight:600">${sign(x)}</td></tr>`).join("")
+      : `<tr><td colspan="4">El modelo acertó: sin ajustes.</td></tr>`;
+    return `<h3>Ajustes sobre la predicción del modelo${v.model ? " · " + escHtml(v.model) : ""} (${dA.length})</h3>
+      <table class="diff-tbl"><thead><tr><th>Parámetro</th><th>Modelo</th><th>Ajustado</th><th>Δ</th></tr></thead><tbody>${body}</tbody></table>`;
+  }
+
+  /* Tabla comparativa: unión de parámetros ajustados por cualquiera de los dos modelos */
+  const dB = diffRows(c.raw, c.adjusted);
+  const mA = new Map(dA.map(x => [x.key, x])), mB = new Map(dB.map(x => [x.key, x]));
+  const keys = [...new Set([...mA.keys(), ...mB.keys()])];
+  const cells = (x, sep) => x
+    ? `<td class="${sep ? "sepl" : ""}">${escHtml(fmtD(x.from))}</td><td>${escHtml(fmtD(x.to))}</td>` +
+      `<td style="color:${col(x)};font-weight:600">${sign(x)}</td>`
+    : `<td class="na ${sep ? "sepl" : ""}" colspan="3">sin ajuste</td>`;
+  const body = keys.length ? keys.map(k =>
+      `<tr><td><b>${escHtml(k)}</b></td>${cells(mA.get(k), true)}${cells(mB.get(k), true)}</tr>`).join("")
+    : `<tr><td colspan="7">Ningún modelo necesitó ajustes.</td></tr>`;
+  const nA = escHtml(v.model || "Modelo A"), nB = escHtml(c.model || "Modelo B");
+  return `<h3>Comparación de ajustes · ${nA} vs ${nB}</h3>
+    <table class="diff-tbl diff-cmp"><thead>
+      <tr><th rowspan="2">Parámetro</th><th class="ga sepl" colspan="3">${nA}</th><th class="gb sepl" colspan="3">${nB}</th></tr>
+      <tr><th class="ga sepl">Modelo</th><th class="ga">Ajustado</th><th class="ga">Δ</th>
+          <th class="gb sepl">Modelo</th><th class="gb">Ajustado</th><th class="gb">Δ</th></tr>
+    </thead><tbody>${body}
+      <tr class="sum"><td>Nº de ajustes</td><td class="sepl" colspan="3">${dA.length}</td><td class="sepl" colspan="3">${dB.length}</td></tr>
+    </tbody></table>`;
+}
+function renderDiffCard(){ const el = $("viewerDiff"); if (el && VIEW) el.innerHTML = diffSectionHtml(); }
+
+function renderAdjStats(){
+  const el = $("adjStats"); if (!el) return;
+  const A = {}, B = {}; let nA = 0, chA = 0, nB = 0, chB = 0, nameA = "", nameB = "";
+  const acc = (store, raw, adj) => {
+    const d = diffRows(raw, adj);
+    d.forEach(x => {
+      const s = store[x.key] || (store[x.key] = { n: 0, sum: 0, abs: 0, nn: 0 });
+      s.n++;
+      if (x.delta != null) { s.sum += x.delta; s.abs += Math.abs(x.delta); s.nn++; }
+    });
+    return d.length;
+  };
+  state.results.forEach((_, i) => getConnVariations(i).forEach(v => {
+    if (v.unavailable || !v.raw || !Object.keys(v.raw).length) return;
+    nA++; nameA = v.model || nameA;
+    if (acc(A, v.raw, v.adjusted)) chA++;
+    if (v.cmp && v.cmp.raw && Object.keys(v.cmp.raw).length) {
+      nB++; nameB = v.cmp.model || nameB;
+      if (acc(B, v.cmp.raw, v.cmp.adjusted)) chB++;
+    }
+  }));
+  if (!nA) { el.innerHTML = ""; return; }
+  const hasB = nB > 0;
+  const pct = (s, n) => s ? `${s.n} (${Math.round(100 * s.n / n)}%)` : "–";
+  const dm = s => s && s.nn ? fmtD(s.sum / s.nn) : "";
+  const am = s => s && s.nn ? fmtD(s.abs / s.nn) : "";
+  const keys = [...new Set([...Object.keys(A), ...Object.keys(B)])]
+    .sort((a, b) => ((B[b]?.n || 0) + (A[b]?.n || 0)) - ((B[a]?.n || 0) + (A[a]?.n || 0)));
+  const rows = keys.map(k => hasB
+    ? `<tr><td><b>${escHtml(k)}</b></td><td>${pct(A[k], nA)}</td><td>${dm(A[k])}</td><td>${am(A[k])}</td>` +
+      `<td style="border-left:2px solid var(--tr-line)">${pct(B[k], nB)}</td><td>${dm(B[k])}</td><td>${am(B[k])}</td></tr>`
+    : `<tr><td><b>${escHtml(k)}</b></td><td>${pct(A[k], nA)}</td><td>${dm(A[k])}</td><td>${am(A[k])}</td>` +
+      `<td><div style="background:#0066B3;height:8px;width:${Math.round(100 * (A[k]?.n || 0) / nA)}px"></div></td></tr>`).join("");
+  const head = hasB
+    ? `<tr><th rowspan="2">Parámetro</th><th colspan="3" style="background:#002B5C">${escHtml(nameA)}</th>` +
+      `<th colspan="3" style="background:#7B1FA2;border-left:2px solid #fff">${escHtml(nameB)}</th></tr>` +
+      `<tr><th>Variantes corregidas</th><th>Δ medio</th><th>|Δ| medio</th><th style="background:#7B1FA2;border-left:2px solid #fff">Variantes corregidas</th><th style="background:#7B1FA2">Δ medio</th><th style="background:#7B1FA2">|Δ| medio</th></tr>`
+    : `<tr><th>Parámetro</th><th>Variantes corregidas</th><th>Δ medio</th><th>|Δ| medio</th><th></th></tr>`;
+  const title = hasB
+    ? `Correcciones al modelo: ${escHtml(nameA)} ${chA}/${nA} · ${escHtml(nameB)} ${chB}/${nB} variantes ajustadas`
+    : `Correcciones al modelo: ${chA}/${nA} variantes ajustadas`;
+  el.innerHTML = `<details style="margin-top:14px" ${hasB ? "open" : ""}><summary style="font-weight:700;color:var(--tr-navy);cursor:pointer">${title}</summary>
+    <table style="margin-top:8px"><thead>${head}</thead>
+    <tbody>${rows || `<tr><td colspan="7">Sin ajustes.</td></tr>`}</tbody></table></details>`;
+}
+
+/* Geometría de la predicción cruda (para dibujarla en fantasma) */
+function rawGeom(){
+  const v = getConnVariations(VIEW.connIdx)[VIEW.activeVarIndex];
+  const r = v && v.raw; if (!r || !Object.keys(r).length) return null;
+  const g = k => vNum(getFieldInfo(r, [k]).value);
+  const tf = vNum(VIEW.sec.beam_tf), e = g("dev");
+  const steps = [g("pfo") + tf + g("pfi"), g("pb"), ...P_KEYS.map(k => g(k))].filter(x => x > 0);
+  const rows = [e]; let y = e; steps.forEach(s => { y += s; rows.push(y); });
+  return { rows, Bp: g("b_ep"), g: g("p2_ep"), Lp: 2 * e + steps.reduce((a, b) => a + b, 0) };
 }
 
 /* =====================================================================
@@ -210,7 +333,7 @@ function renderTable(){
 function renderResults(){
   const res = state.results;
   $("resSec").style.display = res.length ? "" : "none";
-  if (!res.length){ renderAcceptedTable(); return; }
+  if (!res.length){ renderAdjStats(); renderAcceptedTable(); return; }
 
   const head = `
     <th>Conexión (Unicode)</th>
@@ -237,6 +360,9 @@ function renderResults(){
         const st = v.status || (isCumple ? "CUMPLE" : "NO CUMPLE");
         const badgeCls = st === "CUMPLE" ? "ok" : st === "NO CUMPLE" ? "bad" : "mod";
         const isChecked = !!v.accepted;
+        const nAdj = diffRows(v.raw, v.adjusted).length;
+        const nAdjB = (v.cmp && v.cmp.raw && Object.keys(v.cmp.raw).length) ? diffRows(v.cmp.raw, v.cmp.adjusted).length : null;
+        const adjTxt = nAdjB == null ? `${nAdj} ajustes` : `${escHtml(v.model || "A")}: ${nAdj} · ${escHtml(v.cmp.model || "B")}: ${nAdjB}`;
 
         return `
           <div class="var-card-item ${isChecked ? "accepted" : ""}">
@@ -244,6 +370,7 @@ function renderResults(){
               <input type="checkbox" class="var-accept-chk" data-conn="${connIdx}" data-var="${vI}" ${isChecked ? "checked" : ""}>
               <span>${escHtml(v.label)}</span>
             </label>
+            <small title="Parámetros que difieren de la predicción del modelo" style="color:var(--tr-muted)">${adjTxt}</small>
             <span class="badge ${badgeCls}">${escHtml(st)}</span>
           </div>
         `;
@@ -276,6 +403,7 @@ function renderResults(){
     b.onclick = () => openViewer(+b.dataset.viewConn, +b.dataset.viewVar);
   });
 
+  renderAdjStats();   // [NUEVO]
   renderAcceptedTable();
 }
 
@@ -460,6 +588,7 @@ function setStatus(kind, text, detail){
    ===================================================================== */
 const PROFILE_CACHE = {};
 let VIEW = null;
+let SHOW_GHOST = true;
 
 const P_KEYS = ["p3","p4","p5","p6","p7","p8","p9","p10","p11","p12"];
 
@@ -620,6 +749,7 @@ async function loadViewerVariation(varIdx){
     : "";
 
   buildViewerPanel();
+  renderDiffCard();
   drawAll();
   checkViewerConnection();
 }
@@ -1181,8 +1311,10 @@ function drawAll(){
 
 function drawFront(m){
   const W = 520, H = 620, cx = 230, top = 40;
-  const maxH = Math.max(m.Lp, m.beamBot, 1);
-  const scale = Math.min(0.9, (H - 90)/maxH, (W - 200)/Math.max(m.Bp, 1));
+  const G = SHOW_GHOST ? rawGeom() : null;                               // predicción cruda (puede ser mayor que la ajustada)
+  const maxH = Math.max(m.Lp, m.beamBot, G ? G.Lp : 0, 1);
+  const maxB = Math.max(m.Bp, G ? G.Bp : 0, 1);
+  const scale = Math.min(0.9, (H - 90)/maxH, (W - 200)/maxB);
   const Y = v => top + v*scale, X = v => cx + v*scale;
   let s = "";
   s += svgRect(cx - (m.Bp/2)*scale, top, m.Bp*scale, m.Lp*scale, "#cfd8e3");
@@ -1199,8 +1331,16 @@ function drawFront(m){
     s += svgCircle(X(-m.g/2), Y(yy), r, "#ff4500");
     s += svgCircle(X(m.g/2), Y(yy), r, "#ff4500");
   });
-  const xL = cx - (m.Bp/2)*scale - 18;
-  const xR = cx + (m.Bp/2)*scale + 22;
+  /* [NUEVO] Predicción del modelo sin ajustar, en fantasma */
+  if (G && G.Bp > 0) {
+    s += `<rect x="${cx - (G.Bp/2)*scale}" y="${top}" width="${G.Bp*scale}" height="${G.Lp*scale}" fill="none" stroke="#7B1FA2" stroke-width="1.5" stroke-dasharray="6,4"/>`;
+    G.rows.forEach(yy => [-1, 1].forEach(sg => {
+      s += `<circle cx="${X(sg*G.g/2)}" cy="${Y(yy)}" r="${r}" fill="none" stroke="#7B1FA2" stroke-width="1.5" stroke-dasharray="3,2"/>`;
+    }));
+    s += svgText(8, 14, "- - predicción del modelo (sin ajustar)", "start", "#7B1FA2");
+  }
+  const xL = cx - (maxB/2)*scale - 18;
+  const xR = cx + (maxB/2)*scale + 22;
   s += dimV(xL, Y(0), Y(m.rows[0]), "e=" + fmt(m.e));
   s += dimV(xL, Y(m.rows[0]), Y(m.beamTop), "pfo=" + fmt(m.pfo));
   if (m.rows[1] != null && m.rows[1] > m.beamTop + m.tf)
@@ -1427,61 +1567,314 @@ $("clear").onclick = () => {
   renderTable(); renderResults(); setStatus("", "");
 };
 
+$("viewerGhost").onclick = () => {
+  SHOW_GHOST = !SHOW_GHOST;
+  $("viewerGhost").textContent = SHOW_GHOST ? "Ocultar predicción del modelo" : "Mostrar predicción del modelo";
+  drawAll();
+};
+
+const WEB_JOB_ROWS = 25;
+const WEB_POLL_MS = 250;
+const WEB_POLL_MAX = 4;
+const WEB_TIMEOUT_MS = 10000;
+const WEB_MAX_WAIT_MS = 5000;
+
+function sleep(ms){ return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function rowUid(row){
+  return String((row && (row.UNICODE || row.Unicode)) || "?");
+}
+
+function isTransientStatus(status){
+  return status === "TIMEOUT_SERVIDOR"
+    || status === "SERVIDOR_OCUPADO"
+    || status === "ERROR_SERVIDOR";
+}
+
+function backoffMs(attempt){
+  return Math.min(WEB_MAX_WAIT_MS, 500 * Math.pow(2, Math.min(attempt, 4)));
+}
+
+function makeErrorConnection(inputRow, mensaje){
+  return {
+    inputRow: inputRow || {},
+    activeVarIndex: 0,
+    marked: false,
+    variations: [{
+      label: "Error", tipo: "ERROR", data: {}, adjusted: {}, raw: {},
+      check: null, adjustedCheck: null, unavailable: true,
+      motivo: mensaje || "Error al procesar la conexión",
+      status: "ERROR", accepted: false
+    }]
+  };
+}
+
+function newClientId(){
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "job-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+}
+
+async function fetchJson(url, opts, timeoutMs){
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...opts, signal: controller.signal });
+    if (!r.ok) {
+      const err = new Error("HTTP " + r.status);
+      err.status = r.status;
+      throw err;
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function createScenarioJob(desc){
+  const body = {
+    client_id: desc.clientId,
+    model: desc.model,
+    rows: desc.items.map(item => item.row),
+    incremento: 0.05,
+    max_pasos: 40
+  };
+  return await fetchJson("/scenarios/batch/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }, WEB_TIMEOUT_MS);
+}
+
+async function pollScenarioJob(desc){
+  const url = "/scenarios/batch/jobs/" + encodeURIComponent(desc.jobId)
+    + "?since=" + desc.since + "&limit=1";
+  return await fetchJson(url, { method: "GET" }, WEB_TIMEOUT_MS);
+}
+
+/* Adjunta a cada variación del modelo A la predicción/ajuste del modelo B (misma conexión y mismo escenario) */
+function attachComparison(connsA, connsB, modelA, modelB) {
+  connsA.forEach((cA, i) => {
+    const cB = connsB[i];
+    getConnVariations2(cA).forEach(v => { v.model = modelA; });
+    if (!cB) return;
+    const varsB = getConnVariations2(cB);
+    getConnVariations2(cA).forEach((vA, idx) => {
+      if (vA.unavailable) return;
+      const vB = varsB.find(x => !x.unavailable && x.tipo === vA.tipo) || (varsB[idx] && !varsB[idx].unavailable ? varsB[idx] : null);
+      if (!vB) return;
+      vA.cmp = { model: modelB, raw: vB.raw, adjusted: vB.adjusted, check: vB.check, status: vB.status };
+    });
+  });
+}
+const getConnVariations2 = conn => Array.isArray(conn.variations) ? conn.variations : [];
+
 $("send").onclick = async () => {
   const btn = $("send");
-  btn.disabled = true; 
-  setStatus("", "Pre-diseñando " + state.rows.length + " combinaciones (calculando 3 variaciones por conexión)…");
+  if (!state.rows.length) return;
+  btn.disabled = true;
+  const model = $("model").value;
+  const model2 = $("model2").value && $("model2").value !== model ? $("model2").value : "";
+  const rows = state.rows.slice();
+  const results = new Array(rows.length).fill(null);
+  const rowState = rows.map(() => ({ a: null, b: null, rendered: false, bCounted: false }));
+  const doneSet = new Set();
+  let errorsA = 0, errorsB = 0;
+  const modelList = model2 ? [model, model2] : [model];
 
-  try {
-    const model = $("model").value;
+  state.results = []; _checkTokens = {}; renderResults();
+  setStatus("", `Pre-diseñando ${rows.length} conexiones${model2 ? ` con ${model} y ${model2}` : ""}…`);
 
-    const promises = state.rows.map(row => 
-      fetch("/scenarios", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: model,
-          row: row,
-          incremento: 0.05,
-          max_pasos: 40
-        })
-      }).then(async r => {
-        const json = await r.json().catch(() => ({}));
-        return { ok: r.ok, status: r.status, data: json, inputRow: row };
-      }).catch(err => ({ ok: false, error: err.message, inputRow: row }))
-    );
+  const makeDesc = (m, items) => ({
+    clientId: newClientId(),
+    model: m,
+    items: items.map(item => ({ row: item.row, idx: item.idx })),
+    byIdx: new Map(items.map(item => [String(item.row.__web_id), item])),
+    since: 0,
+    jobId: null,
+    estado: "pendiente",
+    done: false,
+    polling: false,
+    attempt: 0,
+    nextTry: 0,
+    transient: []
+  });
 
-    const responses = await Promise.all(promises);
-    const parsedConns = [];
-    let errorsCount = 0;
+  const active = [];
+  for (let i = 0; i < rows.length; i += WEB_JOB_ROWS) {
+    const items = rows.slice(i, i + WEB_JOB_ROWS).map((row, j) => ({
+      row: { ...row, __web_id: i + j }, idx: i + j
+    }));
+    for (const m of modelList) active.push(makeDesc(m, items));
+  }
 
-    responses.forEach(res => {
-      if (res.ok && res.data) {
-        const conns = parseScenariosResponse(res.data, res.inputRow);
-        if (conns.length > 0) {
-          parsedConns.push(...conns);
-        }
-      } else {
-        errorsCount++;
-      }
+  let renderScheduled = false;
+  const scheduleRender = () => {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    requestAnimationFrame(() => {
+      renderScheduled = false;
+      state.results = results.flatMap(conns => conns || []);
+      renderResults();
     });
+  };
 
-    state.results = parsedConns;
-    _checkTokens = {};
-    renderResults();
+  const renderRow = (idx) => {
+    const st = rowState[idx];
+    if (!st.a) return;
+    if (!st.a.ok) {
+      if (!st.rendered) {
+        results[idx] = [makeErrorConnection(rows[idx], st.a.mensaje)];
+        errorsA++; st.rendered = true; doneSet.add(idx);
+        scheduleRender();
+      }
+      return;
+    }
+    try {
+      const connsA = parseScenariosResponse(st.a.data, rows[idx]);
+      if (!connsA.length) throw new Error("Respuesta vacía");
+      let connsB = [];
+      if (model2 && st.b) {
+        if (st.b.ok) connsB = parseScenariosResponse(st.b.data, rows[idx]);
+        else if (!st.bCounted) { errorsB++; st.bCounted = true; }
+      }
+      attachComparison(connsA, connsB, model, model2);
+      results[idx] = connsA;
+      st.rendered = true; doneSet.add(idx);
+      scheduleRender();
+    } catch (e) {
+      results[idx] = [makeErrorConnection(rows[idx], e.message)];
+      errorsA++; st.rendered = true; doneSet.add(idx);
+      scheduleRender();
+    }
+  };
 
-    const totalVars = state.results.reduce((acc, c) => acc + getConnVariations(state.results.indexOf(c)).filter(v => !v.unavailable).length, 0);
-    
-    if (errorsCount > 0) {
-      setStatus("bad", `Finalizado con ${errorsCount} errores.`, `${parsedConns.length} conexiones procesadas correctamente (${totalVars} variaciones).`);
+  const handleResult = (desc, r) => {
+    const key = String(r.web_id);
+    const item = desc.byIdx.get(key);
+    if (!item) return;
+    const idx = item.idx;
+    const slot = desc.model === model ? "a" : "b";
+    if (r.status === "OK" && r.resultado) {
+      rowState[idx][slot] = { ok: true, data: r.resultado };
+      renderRow(idx);
+    } else if (isTransientStatus(r.status)) {
+      desc.transient.push(item);
     } else {
-      setStatus("ok", `Predicción completada: ${parsedConns.length} conexiones (${totalVars} variaciones obtenidas). Pulsa 👁 para ver en 2D.`);
+      rowState[idx][slot] = { ok: false, mensaje: r.mensaje || r.status };
+      if (slot === "b" && !rowState[idx].bCounted) {
+        errorsB++; rowState[idx].bCounted = true;
+      }
+      renderRow(idx);
+    }
+  };
+
+  const processData = (desc, data) => {
+    if (typeof data.siguiente === "number") desc.since = data.siguiente;
+    for (const r of data.resultados || []) handleResult(desc, r);
+    desc.estado = data.estado || desc.estado;
+    if (desc.estado === "hecho" && desc.since >= data.total) desc.done = true;
+    if (desc.estado === "hecho" && data.error) {
+      for (const item of desc.items) {
+        const st = rowState[item.idx];
+        const slot = desc.model === model ? "a" : "b";
+        if (!st[slot]) st[slot] = { ok: false, mensaje: data.error };
+      }
+      for (const item of desc.items) renderRow(item.idx);
+      desc.done = true;
+    }
+  };
+
+  const createOne = async (desc) => {
+    while (!desc.jobId) {
+      try {
+        const data = await createScenarioJob(desc);
+        desc.jobId = data.job_id;
+        processData(desc, data);
+        desc.attempt = 0;
+      } catch (e) {
+        desc.attempt++;
+        const wait = backoffMs(desc.attempt);
+        setStatus("", `Reintentando crear lote en ${Math.round(wait / 1000)} s…`);
+        await sleep(wait);
+      }
+    }
+  };
+
+  const startCreate = (desc) => {
+    createOne(desc).catch(e => setStatus("bad", "Error creando lote", e.message));
+  };
+
+  let createCursor = 0;
+  const createWorker = async () => {
+    while (createCursor < active.length) {
+      const desc = active[createCursor++];
+      try {
+        await createOne(desc);
+      } catch (e) {
+        setStatus("bad", "Error creando lote", e.message);
+      }
+    }
+  };
+  for (let w = 0; w < Math.min(4, active.length); w++) createWorker();
+
+  let pollInFlight = 0;
+  const pollOne = (desc) => {
+    if (desc.done || desc.polling || !desc.jobId || Date.now() < desc.nextTry) return;
+    if (pollInFlight >= WEB_POLL_MAX) return;
+    desc.polling = true; pollInFlight++;
+    const before = desc.since;
+    pollScenarioJob(desc).then(data => {
+      desc.attempt = 0;
+      processData(desc, data);
+      desc.nextTry = desc.since > before ? 0 : Date.now() + WEB_POLL_MS;
+    }).catch(e => {
+      desc.attempt++;
+      desc.nextTry = Date.now() + backoffMs(desc.attempt);
+      if (e.status === 404) {
+        desc.jobId = null; desc.since = 0; desc.done = false; desc.nextTry = 0;
+        startCreate(desc);
+      }
+    }).finally(() => {
+      desc.polling = false; pollInFlight--;
+    });
+  };
+
+  while (true) {
+    for (const desc of active) pollOne(desc);
+
+    for (const desc of active) {
+      if (desc.done && desc.transient.length) {
+        const pendientes = desc.transient.splice(0);
+        for (const item of pendientes) {
+          const nd = makeDesc(desc.model, [{ row: item.row, idx: item.idx }]);
+          active.push(nd);
+          startCreate(nd);
+        }
+      }
     }
 
-  } catch (e){
-    setStatus("bad", "Error de conexión", e.message);
+    if (!active.some(desc => !desc.done)) break;
+    setStatus("", `Procesando ${doneSet.size}/${rows.length}${errorsA || errorsB ? ` (${errorsA + errorsB} errores)` : ""}…`);
+    await sleep(WEB_POLL_MS);
   }
-  btn.disabled = !state.rows.length;
+
+  state.results = results.flatMap(conns => conns || []);
+  renderResults();
+  const totalVars = state.results.reduce(
+    (acc, c) => acc + getConnVariations(state.results.indexOf(c)).filter(v => !v.unavailable).length, 0
+  );
+  const extra = errorsB ? ` (${errorsB} combinaciones sin resultado de ${model2})` : "";
+  if (errorsA > 0) {
+    setStatus("bad", `Finalizado con ${errorsA} errores.`,
+              `${doneSet.size - errorsA} conexiones correctas (${totalVars} variaciones).${extra}`);
+  } else if (errorsB > 0) {
+    setStatus("bad", `Predicción completada, pero ${model2} falló en ${errorsB} combinaciones.`,
+              `${doneSet.size} conexiones (${totalVars} variaciones).`);
+  } else {
+    setStatus("ok", `Predicción completada: ${doneSet.size} conexiones (${totalVars} variaciones obtenidas)` +
+              (model2 ? ` · comparando ${model} vs ${model2}` : "") + `. Pulsa 👁 para ver en 2D.`);
+  }
+  btn.disabled = false;
 };
 
 /* =====================================================================
@@ -1525,8 +1918,29 @@ async function loadModels(){
     const o = await r.json();
     const sel = $("model");
     const models = o.available_models || [];
+    const loaded = o.loaded_models || [];
     sel.innerHTML = models.map(m => `<option value="${escAttr(m)}">${escHtml(m)}</option>`).join("");
-    if (o.default_model && models.includes(o.default_model)) sel.value = o.default_model;
+    const sel2 = $("model2");
+    sel2.innerHTML = `<option value="">— Sin comparación —</option>` + models.map(m => `<option value="${escAttr(m)}">${escHtml(m)}</option>`).join("");
+    const num = m => { const x = String(m).match(/\d+/g); return x ? Math.max(...x.map(Number)) : -1; };
+    const best = models.reduce((a, b) => (num(b) > num(a) ? b : a), models[0]);
+    if (!best) return;
+    if (!loaded.includes(best)) {
+      setStatus("", "Cargando modelo " + best + "…");
+      const a = await fetch("/model/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: best }),
+      });
+      if (!a.ok) {
+        // no se pudo cargar: se usa el modelo por defecto del servidor
+        if (o.default_model && models.includes(o.default_model)) sel.value = o.default_model;
+        setStatus("bad", "No se pudo cargar " + best + "; se usa " + o.default_model);
+        return;
+      }
+      setStatus("", "");
+    }
+    sel.value = best;
   } catch(e){}
 }
 
@@ -1540,6 +1954,20 @@ async function loadSchema(){
     renderForm(); renderTable();
   } catch (e){ setStatus("bad", "Error cargando esquema", e.message); }
 }
+
+/* Al elegir el modelo de comparación se activa en el servidor si aún no está cargado */
+$("model2").onchange = async () => {
+  const m = $("model2").value; if (!m) return;
+  try {
+    const o = await (await fetch("/models")).json();
+    if (!(o.loaded_models || []).includes(m)) {
+      setStatus("", "Cargando modelo " + m + "…");
+      const a = await fetch("/model/activate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: m }) });
+      if (!a.ok) { setStatus("bad", "No se pudo cargar " + m); $("model2").value = ""; return; }
+      setStatus("", "");
+    }
+  } catch (e) {}
+};
 
 $("model").onchange = () => {
   state.rows = []; state.results = []; _checkTokens = {};
